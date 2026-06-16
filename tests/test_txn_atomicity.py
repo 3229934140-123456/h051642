@@ -80,7 +80,48 @@ def test_transaction_atomic_unique_index():
         print(f"  通过索引查 bob@test.com: {len(bob_by_idx)} 条 (预期: 0)")
         assert len(bob_by_idx) == 0
 
+        old_by_idx = users.find({"email": "duplicate@test.com"})
+        print(f"  通过索引查 duplicate@test.com: {len(old_by_idx)} 条 (预期: 1)")
+        assert len(old_by_idx) == 1
+        assert old_by_idx[0].get("name") == "Existing"
+
+        # --- 关库重开再查 ---
         db.close()
+        print("\n  [重启验证] 关闭数据库，重新打开...")
+        db_reopen = Database("testdb", data_dir=tmp_dir)
+        users_reopen = db_reopen.get_collection("users")
+
+        reopen_count = users_reopen.count()
+        print(f"  重启后文档数量: {reopen_count} (预期: 1)")
+        assert reopen_count == 1, f"重启后期望 1，实际 {reopen_count}"
+
+        alice_reopen = users_reopen.find_one({"name": "Alice"})
+        print(f"  重启后 Alice 是否存在: {alice_reopen is not None} (预期: False)")
+        assert alice_reopen is None, "重启后 Alice 应该被回滚"
+
+        bob_reopen = users_reopen.find_one({"name": "Bob"})
+        print(f"  重启后 Bob 是否存在: {bob_reopen is not None} (预期: False)")
+        assert bob_reopen is None, "重启后 Bob 应该被回滚"
+
+        old_reopen = users_reopen.find_one({"name": "Existing"})
+        print(f"  重启后旧用户 Existing 是否存在: {old_reopen is not None} (预期: True)")
+        assert old_reopen is not None, "重启后旧用户应该保留"
+
+        # 重启后按 email 索引查
+        alice_idx_reopen = users_reopen.find({"email": "alice@test.com"})
+        print(f"  重启后通过索引查 alice@test.com: {len(alice_idx_reopen)} 条 (预期: 0)")
+        assert len(alice_idx_reopen) == 0
+
+        bob_idx_reopen = users_reopen.find({"email": "bob@test.com"})
+        print(f"  重启后通过索引查 bob@test.com: {len(bob_idx_reopen)} 条 (预期: 0)")
+        assert len(bob_idx_reopen) == 0
+
+        consistency_reopen = users_reopen.index_manager.validate_index_consistency()
+        for idx_name, info in consistency_reopen.items():
+            print(f"  重启后索引 {idx_name} 一致性: {info['consistent']}")
+            assert info["consistent"]
+
+        db_reopen.close()
         print("\n✅ 唯一索引冲突回滚测试通过\n")
         return True
 

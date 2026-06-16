@@ -395,16 +395,24 @@ class IndexManager:
     def index_document(self, doc: Document) -> None:
         """
         文档插入时，将文档加入所有索引
-        
-        索引维护原则:
-        - 对每个索引，提取字段值
-        - 将 doc_id 加入对应键的列表
-        - 对唯一索引做冲突检查
+
+        原子性: 若中途某个索引写入失败（如唯一冲突），已写入的索引会被回滚。
         """
         with self._lock:
-            for idx_info in self._indexes.values():
-                self._index_document_single(doc, idx_info)
-                idx_info._dirty = True
+            applied_indexes: List[IndexInfo] = []
+            try:
+                for idx_info in self._indexes.values():
+                    self._index_document_single(doc, idx_info)
+                    applied_indexes.append(idx_info)
+                    idx_info._dirty = True
+            except Exception:
+                for idx_info in reversed(applied_indexes):
+                    try:
+                        self._unindex_document_single(doc, idx_info)
+                        idx_info._dirty = True
+                    except Exception:
+                        pass
+                raise
 
     def _unindex_document_single(self, doc: Document, idx_info: IndexInfo) -> None:
         """将文档从指定索引中移除"""
@@ -431,41 +439,53 @@ class IndexManager:
     def update_document(self, old_doc: Document, new_doc: Document) -> None:
         """
         文档更新时，维护所有索引
-        
+
+        原子性: 若中途某个索引更新失败，已更新的索引会被回滚。
+
         索引维护策略:
         1. 先从所有索引中删除旧版本文档的条目
         2. 再将新版本文档加入所有索引
-        
-        这样确保:
-        - 不会出现索引指向旧版本的情况
-        - 字段值变化时，索引能正确反映
-        - 即使更新过程中出错，也不会有不一致
         """
         with self._lock:
-            for idx_info in self._indexes.values():
-                old_values = set(
-                    self._extract_index_values(old_doc, idx_info.field)
-                )
-                new_values = set(
-                    self._extract_index_values(new_doc, idx_info.field)
-                )
+            applied: List[Tuple[IndexInfo, set, set]] = []
+            try:
+                for idx_info in self._indexes.values():
+                    old_values = set(
+                        self._extract_index_values(old_doc, idx_info.field)
+                    )
+                    new_values = set(
+                        self._extract_index_values(new_doc, idx_info.field)
+                    )
 
-                removed_values = old_values - new_values
-                added_values = new_values - old_values
+                    removed_values = old_values - new_values
+                    added_values = new_values - old_values
 
-                if idx_info.tree:
-                    for val in removed_values:
-                        idx_info.tree.delete(val, new_doc.id)
-                    for val in added_values:
-                        if idx_info.unique:
-                            existing = idx_info.tree.get(val)
-                            if existing and new_doc.id not in existing:
-                                raise ValueError(
-                                    f"Duplicate key '{val}' for unique index '{idx_info.name}'"
-                                )
-                        idx_info.tree.insert(val, new_doc.id)
+                    if idx_info.tree:
+                        for val in removed_values:
+                            idx_info.tree.delete(val, new_doc.id)
+                        for val in added_values:
+                            if idx_info.unique:
+                                existing = idx_info.tree.get(val)
+                                if existing and new_doc.id not in existing:
+                                    raise ValueError(
+                                        f"Duplicate key '{val}' for unique index '{idx_info.name}'"
+                                    )
+                            idx_info.tree.insert(val, new_doc.id)
 
-                idx_info._dirty = True
+                    applied.append((idx_info, removed_values, added_values))
+                    idx_info._dirty = True
+            except Exception:
+                for idx_info, removed_values, added_values in reversed(applied):
+                    if idx_info.tree:
+                        try:
+                            for val in added_values:
+                                idx_info.tree.delete(val, new_doc.id)
+                            for val in removed_values:
+                                idx_info.tree.insert(val, new_doc.id)
+                            idx_info._dirty = True
+                        except Exception:
+                            pass
+                raise
 
     def find_by_index(
         self, index_name: str, value: Any
