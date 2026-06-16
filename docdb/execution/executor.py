@@ -313,7 +313,7 @@ class QueryExecutor:
                 if value is not None or field == "_id":
                     self._set_nested_field(new_data, field, value)
         else:
-            new_data = doc.to_dict(include_system_fields=True)
+            new_data = doc.to_dict(include_system_fields=False)
             for field in fields:
                 self._delete_nested_field(new_data, field)
 

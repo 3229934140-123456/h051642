@@ -303,7 +303,7 @@ class QueryParser:
 
         include_fields = set()
         exclude_fields = set()
-        id_include = True
+        id_include = False
         id_set = False
 
         for field, value in projection.items():
@@ -324,7 +324,7 @@ class QueryParser:
             fields = list(include_fields)
             if id_include:
                 fields.append("_id")
-            return {"type": "include", "fields": fields}
+            return {"type": "include", "fields": fields, "id_explicit": id_set}
         elif exclude_fields:
             fields = list(exclude_fields)
             if not id_include and id_set:
