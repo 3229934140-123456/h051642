@@ -520,32 +520,66 @@ class IndexManager:
         """
         校验索引与数据的一致性
         
-        检查:
-        - 索引中的文档是否都存在
-        - 存在的文档是否都在索引中
-        - 索引值与文档字段值是否匹配
+        检查项:
+        1. 悬挂引用: 索引中的文档是否已被删除
+        2. 值不匹配: 索引中存的值和文档实际值是否一致
+        3. 遗漏索引: 存在文档应该在索引中但实际没建索引
+        4. 索引重复/多余: 同一文档同值是否出现多次
         
         Returns:
-            校验结果
+            校验结果字典
+            {
+                index_name: {
+                    "indexed_documents": int,     # 索引覆盖的文档数
+                    "total_documents": int,       # 数据存储中的文档总数
+                    "expected_documents": int,    # 应该被索引的文档数（有值的）
+                    "dangling_references": int,   # 悬挂引用数
+                    "value_mismatches": int,      # 值不匹配数
+                    "missing_index_entries": int, # 遗漏索引数
+                    "missing_docs": [             # 具体遗漏的文档
+                        {"doc_id": ..., "field_value": ...}, ...
+                    ],
+                    "issues": [str, ...],         # 可读的问题描述
+                    "consistent": bool,           # 是否一致
+                }
+            }
         """
         with self._lock:
             results = {}
+
+            total_docs = self._doc_store.count()
 
             for idx_name, idx_info in self._indexes.items():
                 if idx_info.tree is None:
                     continue
 
-                issues = []
+                issues: List[str] = []
                 indexed_docs: Set[str] = set()
+                indexed_entries: Set[Tuple[str, Any]] = set()
+                dangling_count = 0
+                mismatch_count = 0
+                missing_count = 0
+                missing_docs: List[Dict[str, Any]] = []
 
+                # 检查 1 & 2: 遍历索引，找悬挂引用和值不匹配
                 for key, doc_ids in idx_info.tree.iterate():
                     for doc_id in doc_ids:
                         indexed_docs.add(doc_id)
+                        entry_key = (doc_id, key)
+                        if entry_key in indexed_entries:
+                            issues.append(
+                                f"Duplicate index entry: doc '{doc_id}' with value '{key}' "
+                                f"appears multiple times in index '{idx_name}'"
+                            )
+                        indexed_entries.add(entry_key)
+
                         doc = self._doc_store.get(doc_id)
 
                         if doc is None:
+                            dangling_count += 1
                             issues.append(
-                                f"Dangling reference: doc '{doc_id}' in index but deleted"
+                                f"Dangling reference: doc '{doc_id}' is in index "
+                                f"with key '{key}' but document does not exist in store"
                             )
                             continue
 
@@ -553,24 +587,74 @@ class IndexManager:
                             doc, idx_info.field
                         )
                         if key not in actual_values:
+                            mismatch_count += 1
                             issues.append(
-                                f"Value mismatch: doc '{doc_id}' has value {actual_values} "
-                                f"but indexed with '{key}'"
+                                f"Value mismatch: doc '{doc_id}' field '{idx_info.field}' "
+                                f"has actual values {actual_values}, but index has stale key '{key}'"
                             )
 
+                # 检查 3: 遍历所有文档，找遗漏的索引
+                expected_count = 0
                 for doc in self._doc_store.iterate():
+                    if doc.is_deleted:
+                        continue
                     values = self._extract_index_values(doc, idx_info.field)
-                    for val in values:
-                        if val is not None and doc.id not in indexed_docs:
-                            pass
+                    non_null_values = [v for v in values if v is not None]
+                    if non_null_values:
+                        expected_count += len(non_null_values)
+                        for val in non_null_values:
+                            if (doc.id, val) not in indexed_entries:
+                                missing_count += 1
+                                missing_docs.append({
+                                    "doc_id": doc.id,
+                                    "field": idx_info.field,
+                                    "field_value": val,
+                                })
+                                if missing_count <= 10:
+                                    issues.append(
+                                        f"Missing index entry: doc '{doc.id}' field "
+                                        f"'{idx_info.field}' = '{val}' is not in index '{idx_name}'"
+                                    )
+
+                if missing_count > 10:
+                    issues.append(
+                        f"... and {missing_count - 10} more missing index entries (showing first 10)"
+                    )
 
                 results[idx_name] = {
                     "indexed_documents": len(indexed_docs),
+                    "indexed_entries": len(indexed_entries),
+                    "total_documents": total_docs,
+                    "expected_entries": expected_count,
+                    "dangling_references": dangling_count,
+                    "value_mismatches": mismatch_count,
+                    "missing_index_entries": missing_count,
+                    "missing_docs": missing_docs,
                     "issues": issues,
-                    "consistent": len(issues) == 0,
+                    "consistent": (
+                        dangling_count == 0
+                        and mismatch_count == 0
+                        and missing_count == 0
+                    ),
                 }
 
             return results
+
+    def rebuild_all(self) -> int:
+        """
+        重建所有索引（WAL 恢复后调用，确保索引和数据一致）
+        
+        Returns:
+            重建的索引数量
+        """
+        with self._lock:
+            count = 0
+            for idx_info in self._indexes.values():
+                self._build_index(idx_info)
+                idx_info._dirty = True
+                count += 1
+            self.flush()
+            return count
 
     def flush(self) -> None:
         """将所有索引持久化到磁盘"""

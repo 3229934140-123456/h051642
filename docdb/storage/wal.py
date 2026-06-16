@@ -348,17 +348,24 @@ class WAL:
         """
         崩溃恢复：重放 WAL 日志
         
+        恢复规则:
+        - 有 TXN_COMMIT 的事务: 全部重放
+        - txn_id = 0 的单操作（隐式自动提交）: 全部重放
+        - 有 TXN_ABORT 的事务: 跳过
+        - 只有 TXN_BEGIN 但无 COMMIT/ABORT 的事务: 跳过（崩溃时未提交）
+        
         Returns:
             需要应用的操作列表 [(operation, data), ...]
         """
         records = self.iterate_records()
-        committed_txns = set()
-        aborted_txns = set()
+        committed_txns: set = set()
+        aborted_txns: set = set()
         txn_operations: Dict[int, List[Tuple[str, Dict[str, Any]]]] = {}
+        auto_commit_ops: List[Tuple[str, Dict[str, Any]]] = []
 
         for record in records:
             if record.record_type == WALRecordType.TXN_BEGIN:
-                txn_operations[record.txn_id] = []
+                txn_operations.setdefault(record.txn_id, [])
             elif record.record_type == WALRecordType.TXN_COMMIT:
                 committed_txns.add(record.txn_id)
             elif record.record_type == WALRecordType.TXN_ABORT:
@@ -374,16 +381,17 @@ class WAL:
                     WALRecordType.DELETE: "DELETE",
                 }[record.record_type]
 
-                if record.txn_id not in txn_operations:
-                    txn_operations[record.txn_id] = []
-                txn_operations[record.txn_id].append((op_type, record.data))
+                if record.txn_id == 0:
+                    auto_commit_ops.append((op_type, record.data))
+                else:
+                    txn_operations.setdefault(record.txn_id, [])
+                    txn_operations[record.txn_id].append((op_type, record.data))
 
-        result = []
+        result: List[Tuple[str, Dict[str, Any]]] = []
+        result.extend(auto_commit_ops)
         for txn_id, ops in txn_operations.items():
-            if txn_id in committed_txns:
+            if txn_id in committed_txns and txn_id not in aborted_txns:
                 result.extend(ops)
-            elif txn_id not in aborted_txns:
-                pass
 
         return result
 

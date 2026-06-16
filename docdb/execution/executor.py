@@ -298,29 +298,26 @@ class QueryExecutor:
         
         Args:
             doc: 原文档
-            projection: 投影规则
+            projection: 投影规则 {"type": "include"/"exclude", "fields": [...]}
             
         Returns:
-            投影后的文档（新文档对象）
+            投影后的文档（标记为投影模式，to_dict() 只返回投影后的字段）
         """
         proj_type = projection.get("type", "include")
         fields = projection.get("fields", [])
 
         if proj_type == "include":
-            new_data = {}
+            new_data: Dict[str, Any] = {}
             for field in fields:
                 value = doc.get(field)
                 if value is not None or field == "_id":
                     self._set_nested_field(new_data, field, value)
         else:
-            new_data = copy.deepcopy(doc._data)
+            new_data = doc.to_dict(include_system_fields=True)
             for field in fields:
                 self._delete_nested_field(new_data, field)
 
-        result_doc = Document(new_data, doc_id=doc.id, version=doc.version)
-        result_doc._created_at = doc.created_at
-        result_doc._updated_at = doc.updated_at
-        return result_doc
+        return Document(new_data, is_projection=True)
 
     def _set_nested_field(
         self, data: Dict[str, Any], field: str, value: Any

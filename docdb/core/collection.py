@@ -50,6 +50,10 @@ class Collection:
         self._metadata_file = os.path.join(self._collection_dir, "_metadata.json")
         self._load_metadata()
 
+        if self._doc_store.recovered_ops > 0:
+            print(f"  WAL 恢复了 {self._doc_store.recovered_ops} 个操作，重建索引...")
+            self._index_manager.rebuild_all()
+
     def _load_metadata(self) -> None:
         """加载集合元数据"""
         if os.path.exists(self._metadata_file):

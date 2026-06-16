@@ -470,10 +470,12 @@ class Transaction:
 
     def _apply_changes(self) -> None:
         """
-        应用所有修改
+        应用所有修改（原子性：要么全部成功，要么全部回滚）
         
-        将写集合中的修改应用到数据库
+        使用补偿事务模式：记录每个已执行操作，中途失败时逐个逆操作回滚。
         """
+        applied_ops: List[Dict[str, Any]] = []
+
         docs_by_collection: Dict[str, Dict[str, Any]] = {}
 
         for key, entry in self._write_set.items():
@@ -494,23 +496,112 @@ class Transaction:
             elif entry["type"] == "delete":
                 docs_by_collection[collection_name]["deletes"].append(entry["doc_id"])
 
-        for collection_name, changes in docs_by_collection.items():
-            collection = self._db.get_collection(collection_name)
+        try:
+            for collection_name, changes in docs_by_collection.items():
+                collection = self._db.get_collection(collection_name)
 
-            for doc in changes["inserts"]:
-                self._do_insert(collection, doc)
+                for doc in changes["inserts"]:
+                    old_doc_snapshot = collection.find_by_id(doc.id)
+                    self._do_insert(collection, doc)
+                    applied_ops.append({
+                        "type": "insert",
+                        "collection": collection,
+                        "doc": doc,
+                        "old_snapshot": old_doc_snapshot,
+                    })
 
-            for old_version, doc in changes["updates"]:
-                self._do_update(collection, doc)
+                for old_version, doc in changes["updates"]:
+                    old_doc = collection.find_by_id(doc.id)
+                    old_doc_snapshot = old_doc.clone() if old_doc else None
+                    self._do_update(collection, doc)
+                    applied_ops.append({
+                        "type": "update",
+                        "collection": collection,
+                        "doc": doc,
+                        "old_snapshot": old_doc_snapshot,
+                    })
 
-            for doc_id in changes["deletes"]:
-                self._do_delete(collection, doc_id)
+                for doc_id in changes["deletes"]:
+                    old_doc = collection.find_by_id(doc_id)
+                    old_doc_snapshot = old_doc.clone() if old_doc else None
+                    self._do_delete(collection, doc_id)
+                    applied_ops.append({
+                        "type": "delete",
+                        "collection": collection,
+                        "doc_id": doc_id,
+                        "old_snapshot": old_doc_snapshot,
+                    })
+        except Exception as apply_exc:
+            self._rollback_applied_ops(applied_ops)
+            self._write_set.clear()
+            self._read_set.clear()
+            raise apply_exc
+
+    def _rollback_applied_ops(self, applied_ops: List[Dict[str, Any]]) -> None:
+        """
+        回滚已经执行的操作（逆操作）
+        
+        按倒序逐个撤销。注意：文档存储是追加式写入，
+        数据文件的旧版本可以保留，只需回滚内存索引和 B+ 树二级索引。
+        """
+        for op in reversed(applied_ops):
+            try:
+                collection = op["collection"]
+                with collection._lock:
+                    if op["type"] == "insert":
+                        doc = op["doc"]
+                        # 逆操作: 从文档存储和二级索引中删除刚插入的文档
+                        if doc.id in collection._doc_store._index:
+                            del collection._doc_store._index[doc.id]
+                            collection._doc_store._doc_count -= 1
+                        # 从二级索引移除
+                        try:
+                            collection._index_manager.unindex_document(doc)
+                        except Exception as idx_exc:
+                            print(f"Warning: rollback unindex failed for insert: {idx_exc}")
+
+                    elif op["type"] == "update":
+                        old_doc = op["old_snapshot"]
+                        new_doc = op["doc"]
+                        if old_doc and new_doc:
+                            # 逆操作: 先移除新版本索引，再把旧版本写回内存索引和二级索引
+                            try:
+                                collection._index_manager.update_document(new_doc, old_doc)
+                            except Exception as idx_exc:
+                                print(f"Warning: rollback update index failed: {idx_exc}")
+                            # 写回旧版本到数据存储（追加式，会产生新版本但内容是旧的）
+                            try:
+                                collection._doc_store._write_doc_to_file(old_doc, update_index=True)
+                            except Exception as ds_exc:
+                                print(f"Warning: rollback update doc_store failed: {ds_exc}")
+
+                    elif op["type"] == "delete":
+                        old_doc = op["old_snapshot"]
+                        if old_doc:
+                            # 逆操作: 重新写回内存索引和二级索引
+                            try:
+                                collection._doc_store._write_doc_to_file(old_doc, update_index=True)
+                            except Exception as ds_exc:
+                                print(f"Warning: rollback delete doc_store failed: {ds_exc}")
+                            try:
+                                collection._index_manager.index_document(old_doc)
+                            except Exception as idx_exc:
+                                print(f"Warning: rollback delete index failed: {idx_exc}")
+            except Exception as rollback_exc:
+                print(f"Warning: rollback step failed ({op.get('type')}): {rollback_exc}")
 
     def _do_insert(self, collection, doc) -> None:
-        """执行插入"""
+        """执行插入（内部具有原子性：索引失败会回滚文档存储）"""
         with collection._lock:
             collection._doc_store.insert(doc)
-            collection._index_manager.index_document(doc)
+            try:
+                collection._index_manager.index_document(doc)
+            except Exception as idx_exc:
+                # 索引失败，回滚文档存储的插入
+                if doc.id in collection._doc_store._index:
+                    del collection._doc_store._index[doc.id]
+                    collection._doc_store._doc_count -= 1
+                raise idx_exc
 
     def _do_update(self, collection, doc) -> None:
         """执行更新"""
@@ -518,15 +609,34 @@ class Transaction:
             old_doc = collection.find_by_id(doc.id)
             if old_doc:
                 collection._doc_store.update(doc)
-                collection._index_manager.update_document(old_doc, doc)
+                try:
+                    collection._index_manager.update_document(old_doc, doc)
+                except Exception as idx_exc:
+                    # 索引失败，尝试把旧文档写回
+                    try:
+                        collection._doc_store.update(old_doc)
+                        collection._index_manager.update_document(doc, old_doc)
+                    except Exception:
+                        pass
+                    raise idx_exc
 
     def _do_delete(self, collection, doc_id) -> None:
         """执行删除"""
         with collection._lock:
             doc = collection.find_by_id(doc_id)
             if doc:
+                old_snapshot = doc.clone()
                 collection._doc_store.delete(doc_id)
-                collection._index_manager.unindex_document(doc)
+                try:
+                    collection._index_manager.unindex_document(doc)
+                except Exception as idx_exc:
+                    # 索引失败，恢复文档
+                    try:
+                        collection._doc_store._write_doc_to_file(old_snapshot, update_index=True)
+                        collection._index_manager.index_document(old_snapshot)
+                    except Exception:
+                        pass
+                    raise idx_exc
 
     def abort(self) -> None:
         """

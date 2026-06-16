@@ -57,10 +57,11 @@ class DocumentStore:
 
         self._lock = threading.RLock()
         self._doc_count = 0
+        self.recovered_ops = 0
 
         self._load_index()
         self._open_current_file()
-        self._recover_if_needed()
+        self.recovered_ops = self._recover_if_needed()
 
     def _index_file_path(self) -> str:
         return os.path.join(self.data_dir, "_doc_index.json")
@@ -113,14 +114,19 @@ class DocumentStore:
         self._current_file = open(file_path, "ab")
         self._current_offset = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-    def _recover_if_needed(self) -> None:
-        """从 WAL 恢复数据"""
+    def _recover_if_needed(self) -> int:
+        """从 WAL 恢复数据（幂等，可多次调用）
+        
+        Returns:
+            恢复的操作数量
+        """
         recover_ops = self._wal.recover()
         if not recover_ops:
-            return
+            return 0
 
         print(f"Recovering {len(recover_ops)} operations from WAL...")
 
+        count = 0
         for op_type, data in recover_ops:
             doc_id = data.get("doc_id")
             if not doc_id:
@@ -132,12 +138,20 @@ class DocumentStore:
                     doc = Document(doc_data)
                     doc._id = doc_id
                     self._write_doc_to_file(doc, update_index=True)
+                    count += 1
             elif op_type == "DELETE":
+                old_data = data.get("old_data", {})
+                tombstone = Document(old_data)
+                tombstone._id = doc_id
+                tombstone.mark_deleted()
+                self._write_doc_to_file(tombstone, update_index=False)
                 if doc_id in self._index:
                     del self._index[doc_id]
                     self._doc_count -= 1
+                count += 1
 
         self._save_index()
+        return count
 
     def _write_doc_to_file(self, doc: Document, update_index: bool = True) -> int:
         """

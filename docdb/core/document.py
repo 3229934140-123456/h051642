@@ -45,6 +45,7 @@ class Document:
         data: Optional[Dict[str, Any]] = None,
         doc_id: Optional[str] = None,
         version: int = 1,
+        is_projection: bool = False,
     ):
         """
         初始化文档
@@ -53,26 +54,32 @@ class Document:
             data: 文档数据字典
             doc_id: 文档ID，不提供则自动生成
             version: 初始版本号
+            is_projection: 是否为投影结果（投影结果的 to_dict() 只返回 _data 中的字段）
         """
         self._id = doc_id or str(uuid.uuid4())
         self._version = version
         self._created_at = time.time()
         self._updated_at = self._created_at
         self._deleted = False
+        self._is_projection = is_projection
         self._data: Dict[str, Any] = {}
 
         if data:
-            self._data = self._extract_user_data(data)
-            if "_id" in data:
-                self._id = str(data["_id"])
-            if "_version" in data:
-                self._version = data["_version"]
-            if "_created_at" in data:
-                self._created_at = data["_created_at"]
-            if "_updated_at" in data:
-                self._updated_at = data["_updated_at"]
-            if "_deleted" in data:
-                self._deleted = data["_deleted"]
+            if is_projection:
+                self._data = copy.deepcopy(data)
+            else:
+                self._data = self._extract_user_data(data)
+            if not is_projection:
+                if "_id" in data:
+                    self._id = str(data["_id"])
+                if "_version" in data:
+                    self._version = data["_version"]
+                if "_created_at" in data:
+                    self._created_at = data["_created_at"]
+                if "_updated_at" in data:
+                    self._updated_at = data["_updated_at"]
+                if "_deleted" in data:
+                    self._deleted = data["_deleted"]
 
     def _extract_user_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """从完整数据中提取用户数据（过滤系统字段）"""
@@ -196,11 +203,14 @@ class Document:
         将文档转换为字典
         
         Args:
-            include_system_fields: 是否包含系统字段
+            include_system_fields: 是否包含系统字段（仅非投影模式有效）
             
         Returns:
             完整的文档字典
         """
+        if self._is_projection:
+            return copy.deepcopy(self._data)
+
         result = copy.deepcopy(self._data)
         if include_system_fields:
             result["_id"] = self._id
